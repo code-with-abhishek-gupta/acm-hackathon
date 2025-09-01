@@ -5,3 +5,4 @@ openpyxl
 pandas
 pillow
 pyttsx3
+pytz
