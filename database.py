@@ -509,6 +509,20 @@ class AttendanceDatabase:
         - EXIT only stamps exit_time & duration; doesn't downgrade status
         """
         try:
+            # Normalize statuses to conform to summary table allowed values
+            # Business spec only uses PRESENT / ABSENT (plus EXIT handling). Any EARLY -> PRESENT, LATE -> ABSENT.
+            if actual_status:
+                upper = actual_status.upper()
+                if upper == 'EARLY':
+                    actual_status = 'present'
+                elif upper == 'LATE':
+                    actual_status = 'absent'
+                elif upper == 'PRESENT':
+                    actual_status = 'present'
+                elif upper == 'ABSENT':
+                    actual_status = 'absent'
+                elif upper == 'EXIT':
+                    actual_status = 'present'  # EXIT marked as present with exit_time
             with self.get_connection() as conn:
                 # Check if summary exists
                 existing = conn.execute("""
@@ -530,58 +544,79 @@ class AttendanceDatabase:
                 grace_period = session_data['grace_period']
                 
                 if not existing:
+                    # Create a new summary record only on a valid entry action
                     if action == 'ENTRY' and actual_status and actual_status.upper() != 'BLOCKED':
                         final_status = actual_status.lower()
                         is_late = final_status in ['absent', 'late']
+                        
                         conn.execute("""
                             INSERT INTO attendance_summary 
                             (student_id, session_id, status, entry_time, is_late)
                             VALUES (?, ?, ?, ?, ?)
                         """, (student_id, session_id, final_status, timestamp.isoformat(), is_late))
                         logger.info(f"Created attendance summary for student {student_id} in session {session_id} with status {final_status}")
+                    elif action == 'EXIT' and actual_status and actual_status.upper() == 'EXIT':
+                        # Handle direct EXIT without prior entry (unusual case)
+                        conn.execute("""
+                            INSERT INTO attendance_summary 
+                            (student_id, session_id, status, exit_time, total_duration, is_late)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (student_id, session_id, 'present', timestamp.isoformat(), 0, False))
+                        logger.info(f"Created attendance summary with exit for student {student_id} in session {session_id}")
+                
                 else:
-                    # Existing summary logic
-                    if action == 'ENTRY':
-                        final_status = existing['status']
-                        # Allow upgrade from absent/late to present if we now have a PRESENT detection
-                        if actual_status and actual_status.upper() == 'PRESENT' and final_status in ['absent', 'late']:
+                    # An existing summary record needs updating
+                    if action == 'ENTRY' and actual_status and actual_status.upper() != 'BLOCKED':
+                        # Logic to upgrade status: if was 'absent' but now is 'present'
+                        current_status = existing['status']
+                        new_status = actual_status.lower()
+                        
+                        final_status = current_status
+                        if new_status == 'present' and current_status in ['absent', 'late']:
                             final_status = 'present'
-                        if not existing['entry_time']:
+                        
+                        is_late = final_status in ['absent', 'late']
+
+                        # Update entry time if it's not set, or if the new entry is earlier
+                        update_entry_time = not existing['entry_time'] or timestamp < datetime.fromisoformat(existing['entry_time'])
+                        
+                        if update_entry_time:
                             conn.execute("""
                                 UPDATE attendance_summary 
                                 SET entry_time = ?, status = ?, is_late = ?
-                                WHERE student_id = ? AND session_id = ?
-                            """, (timestamp.isoformat(), final_status, final_status in ['absent','late'], student_id, session_id))
-                            logger.info(f"Updated entry for student {student_id} (status {final_status})")
+                                WHERE id = ?
+                            """, (timestamp.isoformat(), final_status, is_late, existing['id']))
+                            logger.info(f"Updated entry time and status for student {student_id} to {final_status}")
                         else:
-                            # Status upgrade only
+                            # Only update status if it's an upgrade
+                            conn.execute("""
+                                UPDATE attendance_summary SET status = ?, is_late = ? WHERE id = ?
+                            """, (final_status, is_late, existing['id']))
+                            logger.info(f"Upgraded status for student {student_id} to {final_status}")
+
+                    elif action == 'EXIT':
+                        # Only update exit time if an entry exists
+                        if existing['entry_time']:
+                            entry_time = datetime.fromisoformat(existing['entry_time'])
+                            duration = (timestamp - entry_time).total_seconds() / 60
+                            
+                            # Keep existing status on exit
+                            status = existing['status']
+                            
                             conn.execute("""
                                 UPDATE attendance_summary 
-                                SET status = ?, is_late = ?
-                                WHERE student_id = ? AND session_id = ?
-                            """, (final_status, final_status in ['absent','late'], student_id, session_id))
-                        is_late = final_status in ['absent', 'late']
-                        
-                        conn.execute("""
-                            UPDATE attendance_summary 
-                            SET entry_time = ?, status = ?, is_late = ?
-                            WHERE student_id = ? AND session_id = ?
-                        """, (timestamp.isoformat(), final_status, is_late, student_id, session_id))
-                        logger.info(f"Updated entry for student {student_id} in session {session_id} with status {final_status}")
-                        
-                    elif action == 'EXIT':
-                        entry_time = datetime.fromisoformat(existing['entry_time']) if existing['entry_time'] else timestamp
-                        duration = (timestamp - entry_time).total_seconds() / 60
-                        
-                        # Keep existing status on exit (no early departure checking)
-                        status = existing['status']
-                        
-                        conn.execute("""
-                            UPDATE attendance_summary 
-                            SET exit_time = ?, total_duration = ?, status = ?
-                            WHERE student_id = ? AND session_id = ?
-                        """, (timestamp.isoformat(), int(duration), status, student_id, session_id))
-                        logger.info(f"Updated exit for student {student_id} in session {session_id}")
+                                SET exit_time = ?, total_duration = ?, status = ?
+                                WHERE id = ?
+                            """, (timestamp.isoformat(), int(duration), status, existing['id']))
+                            logger.info(f"Updated exit for student {student_id} in session {session_id}")
+                        else:
+                            # Handle case where exit is recorded without entry time
+                            conn.execute("""
+                                UPDATE attendance_summary 
+                                SET exit_time = ?, total_duration = 0
+                                WHERE id = ?
+                            """, (timestamp.isoformat(), existing['id']))
+                            logger.info(f"Updated exit time without entry for student {student_id} in session {session_id}")
                 
                 conn.commit()
                 return True
@@ -590,26 +625,58 @@ class AttendanceDatabase:
             return False
     
     def get_session_attendance(self, session_id: int) -> List[Dict]:
-        """Get attendance summary for a session"""
+        """Get attendance summary for a session, including all registered students."""
         with self.get_connection() as conn:
-            cursor = conn.execute("""
+            # Get all students first
+            all_students = conn.execute("SELECT enrollment_id, name FROM students ORDER BY name").fetchall()
+            
+            # Get attendance data for this session
+            attendance_data = conn.execute("""
                 SELECT 
-                    s.name as student_name,
-                    s.enrollment_id as student_id,
-                    a.status,
-                    a.entry_time,
-                    a.exit_time,
-                    a.total_duration,
-                    a.is_late,
-                    COUNT(l.id) as total_interactions
-                FROM attendance_summary a
-                JOIN students s ON a.student_id = s.enrollment_id
-                LEFT JOIN attendance_logs l ON a.student_id = l.student_id AND a.session_id = l.session_id
-                WHERE a.session_id = ?
-                GROUP BY s.enrollment_id
-                ORDER BY a.entry_time
-            """, (session_id,))
-            return [dict(row) for row in cursor.fetchall()]
+                    student_id,
+                    status,
+                    entry_time,
+                    exit_time,
+                    total_duration,
+                    is_late
+                FROM attendance_summary
+                WHERE session_id = ?
+            """, (session_id,)).fetchall()
+            
+            # Create a dictionary for quick lookup of attendance
+            attendance_map = {row['student_id']: dict(row) for row in attendance_data}
+            
+            # Combine the lists
+            full_attendance_list = []
+            for student in all_students:
+                student_id = student['enrollment_id']
+                student_name = student['name']
+                
+                if student_id in attendance_map:
+                    # Student has an attendance record for this session
+                    record = attendance_map[student_id]
+                    full_attendance_list.append({
+                        'student_id': student_id,
+                        'student_name': student_name,
+                        'status': record['status'],
+                        'entry_time': record['entry_time'],
+                        'exit_time': record['exit_time'],
+                        'total_duration': record['total_duration'],
+                        'is_late': record['is_late'],
+                    })
+                else:
+                    # Student is registered but has no attendance record for this session (i.e., absent)
+                    full_attendance_list.append({
+                        'student_id': student_id,
+                        'student_name': student_name,
+                        'status': 'absent',
+                        'entry_time': None,
+                        'exit_time': None,
+                        'total_duration': 0,
+                        'is_late': False,
+                    })
+            
+            return full_attendance_list
     
     def get_statistics(self) -> Dict:
         """Get overall system statistics"""
@@ -647,10 +714,21 @@ class AttendanceDatabase:
                 cur = conn.execute("SELECT 1 FROM students WHERE enrollment_id = ?", (enrollment_id,))
                 if cur.fetchone() is None:
                     return False
-                # Delete dependent rows
-                conn.execute("DELETE FROM attendance_events WHERE student_id = ?", (enrollment_id,))
+                
+                # Delete dependent rows from all tables with foreign key constraints
+                # First delete from attendance_logs
+                conn.execute("DELETE FROM attendance_logs WHERE student_id = ?", (enrollment_id,))
+                
+                # Delete from attendance_summary
                 conn.execute("DELETE FROM attendance_summary WHERE student_id = ?", (enrollment_id,))
-                # Delete student
+                
+                # Delete from attendance_sessions
+                conn.execute("DELETE FROM attendance_sessions WHERE student_id = ?", (enrollment_id,))
+                
+                # Delete from attendance_events
+                conn.execute("DELETE FROM attendance_events WHERE student_id = ?", (enrollment_id,))
+                
+                # Finally delete the student record
                 conn.execute("DELETE FROM students WHERE enrollment_id = ?", (enrollment_id,))
                 conn.commit()
                 logger.info(f"Deleted student {enrollment_id} and related attendance data")

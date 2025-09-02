@@ -231,8 +231,9 @@ def recognize_face():
                                 today = current_time.date()
                                 start_time = datetime.datetime.strptime(active_session['start_time'], '%H:%M').time()
                                 end_time = datetime.datetime.strptime(active_session['end_time'], '%H:%M').time()
-                                session_start = datetime.datetime.combine(today, start_time).replace(tzinfo=ist)
-                                session_end = datetime.datetime.combine(today, end_time).replace(tzinfo=ist)
+                                # Use proper timezone localization instead of replace
+                                session_start = ist.localize(datetime.datetime.combine(today, start_time))
+                                session_end = ist.localize(datetime.datetime.combine(today, end_time))
                             else:  # Full datetime format
                                 session_start = datetime.datetime.fromisoformat(active_session['start_time']).replace(tzinfo=ist)
                                 session_end = datetime.datetime.fromisoformat(active_session['end_time']).replace(tzinfo=ist)
@@ -240,103 +241,110 @@ def recognize_face():
                             logger.error(f"Error parsing session times: {e}")
                             continue
 
-                        # Check previous entries
+                        # Simple attendance logic implementation
+                        # Check if student already has attendance record for this session
                         with db.get_connection() as conn:
-                            last_log = conn.execute("""
-                                SELECT action, status, timestamp, message FROM attendance_logs 
-                                WHERE student_id = ? AND session_id = ? 
-                                ORDER BY timestamp DESC LIMIT 1
+                            existing_record = conn.execute("""
+                                SELECT * FROM attendance_summary 
+                                WHERE student_id = ? AND session_id = ?
                             """, (student_id, session_id)).fetchone()
 
-                        action = 'ENTRY'
-                        status = 'PRESENT'
-                        message = ""
-                        tts_message = ""
-
-                        # Time windows based on your requirements:
-                        # - Present: 15 min before start to 10 min after start
-                        # - Absent: more than 10 min after start
-                        # - No exit during class (blocked)
-                        # - Exit only after class ends
+                        # Calculate time windows
+                        early_allowance_minutes = 15  # 15 minutes before class start
+                        grace_period_minutes = int(active_session['grace_period'])
                         
-                        early_window_start = session_start - datetime.timedelta(minutes=15)
-                        late_cutoff = session_start + datetime.timedelta(minutes=10)
+                        early_window_start = session_start - datetime.timedelta(minutes=early_allowance_minutes)
+                        present_cutoff = session_start + datetime.timedelta(minutes=grace_period_minutes)
                         
+                        logger.info(
+                            f"SIMPLE LOGIC for {name}: now={current_time.strftime('%H:%M:%S')} "
+                            f"early_start={early_window_start.strftime('%H:%M:%S')} "
+                            f"present_cutoff={present_cutoff.strftime('%H:%M:%S')} "
+                            f"session_end={session_end.strftime('%H:%M:%S')}"
+                        )
+                        
+                        # Simple logic implementation
                         if current_time < early_window_start:
-                            # Too early - before 15 min window
-                            status = 'BLOCKED'
-                            message = f"Too early - Please come back after {early_window_start.strftime('%H:%M')}"
-                            tts_message = f"{name}, you're too early. Please come back after {early_window_start.strftime('%H:%M')}."
+                            # Too early
+                            action = 'ENTRY'; status = 'BLOCKED'
+                            message = f"Too early. Come after {early_window_start.strftime('%H:%M')}"
+                            tts_message = f"{name}, you're too early. Please return after {early_window_start.strftime('%H:%M')}"
                             
-                        elif early_window_start <= current_time <= late_cutoff:
-                            # Present window: 15 min before to 10 min after start
-                            if not last_log:
-                                status = 'PRESENT'
-                                if current_time < session_start:
-                                    message = f"Present - Early arrival (Class starts at {session_start.strftime('%H:%M')})"
-                                    tts_message = f"Good morning {name}! Attendance marked as present. Class starts at {session_start.strftime('%H:%M')}."
-                                else:
-                                    message = "Present - On time"
-                                    tts_message = f"Welcome {name}! Attendance marked as present."
+                        elif early_window_start <= current_time <= present_cutoff:
+                            # Present window: 15min before to grace period after start
+                            if existing_record:
+                                action = 'ENTRY'; status = 'BLOCKED'
+                                message = "Already recorded for this session"
+                                tts_message = f"{name}, already recorded for this session."
                             else:
-                                status = 'BLOCKED'
-                                message = "Already marked present for this class."
-                                tts_message = f"{name}, you're already marked present for this class."
+                                action = 'ENTRY'; status = 'PRESENT'
+                                message = "Present - attendance recorded"
+                                tts_message = f"Welcome {name}, attendance marked present."
                                 
-                        elif late_cutoff < current_time <= session_end:
-                            # Late arrival during class - marked as absent
-                            if not last_log:
-                                status = 'ABSENT'
-                                message = f"Absent - Late arrival (more than 10 minutes late)"
-                                tts_message = f"{name}, you are more than 10 minutes late. Unfortunately, you are marked as absent for this class."
+                        elif present_cutoff < current_time <= session_end:
+                            # After grace period but class still ongoing - mark absent (no entry allowed)
+                            if existing_record:
+                                action = 'ENTRY'; status = 'BLOCKED'
+                                message = "Already recorded for this session"
+                                tts_message = f"{name}, already recorded for this session."
                             else:
-                                # Already has entry, trying to leave during class
-                                if last_log['status'] in ['PRESENT']:
-                                    status = 'BLOCKED'
-                                    message = "Cannot leave during class hours. Please wait until class ends."
-                                    tts_message = f"{name}, you cannot leave during class hours. Please wait until the class ends."
-                                else:
-                                    status = 'BLOCKED'
-                                    message = "Already processed for this class."
-                                    tts_message = f"{name}, you have already been processed for this class."
-                                    
-                        else:
-                            # After class ends
-                            if last_log and last_log['action'] == 'ENTRY' and last_log['status'] in ['PRESENT']:
-                                action = 'EXIT'
-                                status = 'EXIT'
-                                message = "Class completed - Exit registered"
-                                tts_message = f"Goodbye {name}! Have a great day. Your exit has been recorded."
-                            elif last_log and last_log['action'] == 'EXIT':
-                                status = 'BLOCKED'
-                                message = "Exit already recorded for this class."
-                                tts_message = f"{name}, your exit has already been recorded."
-                            elif last_log and last_log['status'] == 'ABSENT':
-                                status = 'BLOCKED'
-                                message = "Already marked absent - no exit needed"
-                                tts_message = f"{name}, you were marked absent for this class."
-                            elif last_log and last_log['status'] == 'BLOCKED':
-                                status = 'BLOCKED'
-                                message = "Previous entry was blocked - no valid attendance recorded"
-                                tts_message = f"{name}, your previous entry was blocked, so no exit is needed."
-                            elif not last_log:
-                                status = 'BLOCKED'
-                                message = "No entry found for this class."
-                                tts_message = f"{name}, no entry was recorded for this class. Please contact the teacher."
+                                action = 'ENTRY'; status = 'ABSENT'
+                                message = "Late arrival - marked absent"
+                                tts_message = f"{name}, you're late; marked absent."
+                                
+                        else:  # After class end time
+                            # Only allow exit if student was present
+                            if existing_record and existing_record['status'] == 'present' and not existing_record['exit_time']:
+                                action = 'EXIT'; status = 'EXIT'
+                                message = "Exit recorded"
+                                tts_message = f"Goodbye {name}, exit recorded."
+                            elif existing_record and existing_record['exit_time']:
+                                action = 'EXIT'; status = 'BLOCKED'
+                                message = "Exit already recorded"
+                                tts_message = f"{name}, exit already recorded."
+                            elif not existing_record:
+                                action = 'ENTRY'; status = 'ABSENT'
+                                message = "Class ended - marked absent"
+                                tts_message = f"{name}, class ended; you were absent."
                             else:
-                                # Debug: log what the last entry actually was
-                                last_action = last_log['action'] if last_log else 'None'
-                                last_status = last_log['status'] if last_log else 'None'
-                                logger.info(f"Post-class recognition for {name}: last_action={last_action}, last_status={last_status}")
-                                status = 'BLOCKED'
-                                message = f"Invalid attendance state (Last: {last_action}/{last_status})"
-                                tts_message = f"{name}, there's an issue with your attendance record. Please contact the teacher."
+                                action = 'EXIT'; status = 'BLOCKED'
+                                message = "Exit not allowed - you were absent"
+                                tts_message = f"{name}, exit not allowed as you were absent."
 
                         # Log every recognition attempt
                         db.log_attendance_action(student_id, session_id, action, conf, current_time, status, message)
-                        # Only persist summary rows for meaningful attendance states
-                        if status in ['PRESENT', 'ABSENT', 'EXIT']:
-                            db.update_attendance_summary(student_id, session_id, action, current_time, active_session, status)
+                        
+                        # Update attendance summary only for non-blocked actions
+                        if status not in ['BLOCKED']:
+                            if action == 'ENTRY':
+                                # Create or update entry record
+                                with db.get_connection() as conn:
+                                    if existing_record:
+                                        # Update existing record (shouldn't happen with our logic but safety check)
+                                        conn.execute("""
+                                            UPDATE attendance_summary 
+                                            SET status = ?, entry_time = ?
+                                            WHERE student_id = ? AND session_id = ?
+                                        """, (status.lower(), current_time.isoformat(), student_id, session_id))
+                                    else:
+                                        # Create new record
+                                        conn.execute("""
+                                            INSERT INTO attendance_summary 
+                                            (student_id, session_id, status, entry_time, is_late)
+                                            VALUES (?, ?, ?, ?, ?)
+                                        """, (student_id, session_id, status.lower(), current_time.isoformat(), status == 'ABSENT'))
+                                    conn.commit()
+                            elif action == 'EXIT' and status == 'EXIT':
+                                # Update exit time and duration
+                                with db.get_connection() as conn:
+                                    entry_time = datetime.fromisoformat(existing_record['entry_time'])
+                                    duration = int((current_time - entry_time).total_seconds() / 60)
+                                    conn.execute("""
+                                        UPDATE attendance_summary 
+                                        SET exit_time = ?, total_duration = ?
+                                        WHERE student_id = ? AND session_id = ?
+                                    """, (current_time.isoformat(), duration, student_id, session_id))
+                                    conn.commit()
                         try:
                             from improved_tts import speak_message
                             speak_message(tts_message)
@@ -830,21 +838,28 @@ def delete_student(enrollment_id):
     try:
         if db is None:
             return jsonify({"status": "error", "message": "Database not initialized"}), 500
+        
+        # Check if student exists before attempting to delete
+        student = db.get_student(enrollment_id)
+        if not student:
+            return jsonify({"status": "error", "message": "Student not found"}), 404
+            
         removed_images, ok = _delete_student_internal(enrollment_id)
         if not ok:
-            return jsonify({"status": "error", "message": "Student not found"}), 404
+            return jsonify({"status": "error", "message": "Failed to delete student. This may be due to database constraints."}), 500
         # Indicate model retrain advisable
         return jsonify({
             "status": "success",
             "message": f"Student {enrollment_id} deleted. {removed_images} training images removed. Retrain model to apply changes."})
     except Exception as e:
         logger.error(f"Error deleting student {enrollment_id}: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": f"Error: {str(e)}"}), 500
 
 def _delete_student_internal(enrollment_id: str):
     """Helper to delete student images + DB rows. Returns (removed_images, success)."""
     removed_images = 0
     try:
+        # First delete training images
         if os.path.exists(trainimage_path):
             for d in os.listdir(trainimage_path):
                 if d.startswith(f"{enrollment_id}_"):
@@ -854,16 +869,22 @@ def _delete_student_internal(enrollment_id: str):
                             try:
                                 os.remove(os.path.join(root, f))
                                 removed_images += 1
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.warning(f"Failed to remove training image {f}: {e}")
                         try:
                             os.rmdir(root)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"Failed to remove directory {root}: {e}")
                     break
+                    
+        # Then delete database records
         ok = db.delete_student(enrollment_id)
+        if not ok:
+            logger.error(f"Database deletion failed for student {enrollment_id}")
+            
         return removed_images, ok
-    except Exception:
+    except Exception as e:
+        logger.error(f"Unexpected error deleting student {enrollment_id}: {e}")
         return removed_images, False
 
 @app.route('/api/students/bulk-delete', methods=['POST'])
@@ -1033,26 +1054,326 @@ def get_session_attendance(session_id):
     """Get attendance for a specific session"""
     try:
         attendance = db.get_session_attendance(session_id)
-        
-        # Calculate statistics
-        total_students = len(attendance)
-        present_students = len([a for a in attendance if a['status'] in ['present', 'late']])
-        late_students = len([a for a in attendance if a['is_late']])
-        
+
+        total_students = len(db.get_all_students())
+        present_students = len([a for a in attendance if a['status'] == 'present'])
+        late_students = 0
         stats = {
             'total_students': total_students,
             'present_students': present_students,
-            'attendance_rate': (present_students / total_students * 100) if total_students > 0 else 0,
+            'attendance_rate': (present_students / total_students * 100) if total_students else 0,
             'late_students': late_students,
-            'punctuality_rate': ((present_students - late_students) / total_students * 100) if total_students > 0 else 0
+            'punctuality_rate': (present_students * 100 / present_students) if present_students else 0
         }
-        
-        return jsonify({
-            'attendance': attendance,
-            'statistics': stats
-        })
+        return jsonify({'attendance': attendance, 'statistics': stats})
     except Exception as e:
         logger.error(f"Error retrieving session attendance: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+# ========================================
+# REPORTS & ANALYTICS ENDPOINTS
+# ========================================
+
+@app.route('/api/analytics/daily-report', methods=['GET'])
+def get_daily_report():
+    """Get daily attendance report for a specific date"""
+    try:
+        date_str = request.args.get('date', datetime.date.today().isoformat())
+        report_date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+        
+        with db.get_connection() as conn:
+            # Get all sessions for the date
+            sessions = conn.execute("""
+                SELECT s.*, 
+                       COUNT(DISTINCT a.student_id) as total_students,
+                       COUNT(DISTINCT CASE WHEN a.status = 'present' THEN a.student_id END) as present_students,
+                       COUNT(DISTINCT CASE WHEN a.is_late = 1 THEN a.student_id END) as late_students
+                FROM sessions s
+                LEFT JOIN attendance_summary a ON s.id = a.session_id
+                WHERE DATE(s.start_time) = ?
+                GROUP BY s.id
+                ORDER BY s.start_time
+            """, (report_date,)).fetchall()
+            
+            # Get student attendance for the date
+            student_attendance = conn.execute("""
+                SELECT st.name, st.enrollment_id,
+                       COUNT(a.id) as total_sessions,
+                       COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_sessions,
+                       COUNT(CASE WHEN a.is_late = 1 THEN 1 END) as late_sessions,
+                       SUM(COALESCE(a.total_duration, 0)) as total_minutes
+                FROM students st
+                LEFT JOIN attendance_summary a ON st.enrollment_id = a.student_id
+                LEFT JOIN sessions s ON a.session_id = s.id
+                WHERE DATE(s.start_time) = ? OR s.id IS NULL
+                GROUP BY st.enrollment_id
+                ORDER BY present_sessions DESC, st.name
+            """, (report_date,)).fetchall()
+            
+            return jsonify({
+                'date': date_str,
+                'sessions': [dict(row) for row in sessions],
+                'students': [dict(row) for row in student_attendance]
+            })
+    except Exception as e:
+        logger.error(f"Error generating daily report: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/analytics/weekly-report', methods=['GET'])
+def get_weekly_report():
+    """Get weekly attendance report"""
+    try:
+        # Get start of current week (Monday)
+        today = datetime.date.today()
+        start_of_week = today - datetime.timedelta(days=today.weekday())
+        end_of_week = start_of_week + datetime.timedelta(days=6)
+        
+        with db.get_connection() as conn:
+            # Weekly summary by student
+            weekly_data = conn.execute("""
+                SELECT st.name, st.enrollment_id,
+                       COUNT(DISTINCT s.id) as total_sessions,
+                       COUNT(DISTINCT CASE WHEN a.status = 'present' THEN a.session_id END) as present_sessions,
+                       COUNT(DISTINCT CASE WHEN a.is_late = 1 THEN a.session_id END) as late_sessions,
+                       SUM(COALESCE(a.total_duration, 0)) as total_minutes,
+                       ROUND(AVG(CASE WHEN a.status = 'present' THEN 1.0 ELSE 0.0 END) * 100, 1) as attendance_rate
+                FROM students st
+                LEFT JOIN attendance_summary a ON st.enrollment_id = a.student_id
+                LEFT JOIN sessions s ON a.session_id = s.id
+                WHERE DATE(s.start_time) BETWEEN ? AND ?
+                GROUP BY st.enrollment_id
+                ORDER BY attendance_rate DESC, st.name
+            """, (start_of_week, end_of_week)).fetchall()
+            
+            # Daily breakdown for the week
+            daily_breakdown = conn.execute("""
+                SELECT DATE(s.start_time) as date,
+                       COUNT(DISTINCT s.id) as total_sessions,
+                       COUNT(DISTINCT a.student_id) as total_attendees,
+                       COUNT(DISTINCT CASE WHEN a.status = 'present' THEN a.student_id END) as present_students,
+                       ROUND(AVG(CASE WHEN a.status = 'present' THEN 1.0 ELSE 0.0 END) * 100, 1) as attendance_rate
+                FROM sessions s
+                LEFT JOIN attendance_summary a ON s.id = a.session_id
+                WHERE DATE(s.start_time) BETWEEN ? AND ?
+                GROUP BY DATE(s.start_time)
+                ORDER BY DATE(s.start_time)
+            """, (start_of_week, end_of_week)).fetchall()
+            
+            return jsonify({
+                'week_start': start_of_week.isoformat(),
+                'week_end': end_of_week.isoformat(),
+                'students': [dict(row) for row in weekly_data],
+                'daily_breakdown': [dict(row) for row in daily_breakdown]
+            })
+    except Exception as e:
+        logger.error(f"Error generating weekly report: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/analytics/monthly-report', methods=['GET'])
+def get_monthly_report():
+    """Get monthly attendance report"""
+    try:
+        # Get current month or specified month
+        month_str = request.args.get('month', datetime.date.today().strftime('%Y-%m'))
+        year, month = map(int, month_str.split('-'))
+        
+        # First and last day of month
+        first_day = datetime.date(year, month, 1)
+        if month == 12:
+            last_day = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
+        else:
+            last_day = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+        
+        with db.get_connection() as conn:
+            # Monthly summary by student
+            monthly_data = conn.execute("""
+                SELECT st.name, st.enrollment_id,
+                       COUNT(DISTINCT s.id) as total_sessions,
+                       COUNT(DISTINCT CASE WHEN a.status = 'present' THEN a.session_id END) as present_sessions,
+                       COUNT(DISTINCT CASE WHEN a.is_late = 1 THEN a.session_id END) as late_sessions,
+                       SUM(COALESCE(a.total_duration, 0)) as total_minutes,
+                       ROUND(AVG(CASE WHEN a.status = 'present' THEN 1.0 ELSE 0.0 END) * 100, 1) as attendance_rate
+                FROM students st
+                LEFT JOIN attendance_summary a ON st.enrollment_id = a.student_id
+                LEFT JOIN sessions s ON a.session_id = s.id
+                WHERE DATE(s.start_time) BETWEEN ? AND ?
+                GROUP BY st.enrollment_id
+                HAVING total_sessions > 0
+                ORDER BY attendance_rate DESC, st.name
+            """, (first_day, last_day)).fetchall()
+            
+            return jsonify({
+                'month': month_str,
+                'first_day': first_day.isoformat(),
+                'last_day': last_day.isoformat(),
+                'students': [dict(row) for row in monthly_data]
+            })
+    except Exception as e:
+        logger.error(f"Error generating monthly report: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/analytics/student-history/<student_id>', methods=['GET'])
+def get_student_history(student_id):
+    """Get historical attendance data for a specific student"""
+    try:
+        days = int(request.args.get('days', 30))  # Default to last 30 days
+        start_date = datetime.date.today() - datetime.timedelta(days=days)
+        
+        with db.get_connection() as conn:
+            history_data = conn.execute("""
+                SELECT DATE(s.start_time) as date,
+                       s.name as session_name,
+                       s.type as session_type,
+                       a.status,
+                       a.entry_time,
+                       a.exit_time,
+                       a.total_duration,
+                       a.is_late
+                FROM attendance_summary a
+                JOIN sessions s ON a.session_id = s.id
+                WHERE a.student_id = ? AND DATE(s.start_time) >= ?
+                ORDER BY s.start_time DESC
+            """, (student_id, start_date)).fetchall()
+            
+            # Calculate trends
+            daily_summary = conn.execute("""
+                SELECT DATE(s.start_time) as date,
+                       COUNT(*) as total_sessions,
+                       COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_sessions,
+                       SUM(COALESCE(a.total_duration, 0)) as total_minutes
+                FROM attendance_summary a
+                JOIN sessions s ON a.session_id = s.id
+                WHERE a.student_id = ? AND DATE(s.start_time) >= ?
+                GROUP BY DATE(s.start_time)
+                ORDER BY DATE(s.start_time)
+            """, (student_id, start_date)).fetchall()
+            
+            return jsonify({
+                'student_id': student_id,
+                'period_days': days,
+                'start_date': start_date.isoformat(),
+                'detailed_history': [dict(row) for row in history_data],
+                'daily_summary': [dict(row) for row in daily_summary]
+            })
+    except Exception as e:
+        logger.error(f"Error getting student history: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/analytics/today-hours', methods=['GET'])
+def get_today_hours():
+    """Get total hours present today for all students"""
+    try:
+        today = datetime.date.today()
+        
+        with db.get_connection() as conn:
+            today_hours = conn.execute("""
+                SELECT st.name, st.enrollment_id,
+                       COUNT(a.id) as sessions_attended,
+                       SUM(COALESCE(a.total_duration, 0)) as total_minutes,
+                       ROUND(SUM(COALESCE(a.total_duration, 0)) / 60.0, 2) as total_hours,
+                       MAX(a.entry_time) as last_entry,
+                       MAX(a.exit_time) as last_exit
+                FROM students st
+                LEFT JOIN attendance_summary a ON st.enrollment_id = a.student_id
+                LEFT JOIN sessions s ON a.session_id = s.id
+                WHERE DATE(s.start_time) = ? AND a.status = 'present'
+                GROUP BY st.enrollment_id
+                HAVING total_minutes > 0
+                ORDER BY total_hours DESC, st.name
+            """, (today,)).fetchall()
+            
+            return jsonify({
+                'date': today.isoformat(),
+                'students': [dict(row) for row in today_hours]
+            })
+    except Exception as e:
+        logger.error(f"Error getting today's hours: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/analytics/punctuality-leaderboard', methods=['GET'])
+def get_punctuality_leaderboard():
+    """Get punctuality leaderboard (students ranked by on-time attendance)"""
+    try:
+        days = int(request.args.get('days', 30))  # Default to last 30 days
+        start_date = datetime.date.today() - datetime.timedelta(days=days)
+        
+        with db.get_connection() as conn:
+            leaderboard = conn.execute("""
+                SELECT st.name, st.enrollment_id,
+                       COUNT(a.id) as total_sessions,
+                       COUNT(CASE WHEN a.status = 'present' AND a.is_late = 0 THEN 1 END) as on_time_sessions,
+                       COUNT(CASE WHEN a.status = 'present' AND a.is_late = 1 THEN 1 END) as late_sessions,
+                       COUNT(CASE WHEN a.status = 'present' THEN 1 END) as total_present,
+                       ROUND(
+                           COUNT(CASE WHEN a.status = 'present' AND a.is_late = 0 THEN 1 END) * 100.0 / 
+                           NULLIF(COUNT(CASE WHEN a.status = 'present' THEN 1 END), 0), 
+                           1
+                       ) as punctuality_rate,
+                       ROUND(
+                           COUNT(CASE WHEN a.status = 'present' THEN 1 END) * 100.0 / 
+                           NULLIF(COUNT(a.id), 0), 
+                           1
+                       ) as attendance_rate
+                FROM students st
+                LEFT JOIN attendance_summary a ON st.enrollment_id = a.student_id
+                LEFT JOIN sessions s ON a.session_id = s.id
+                WHERE DATE(s.start_time) >= ? OR s.id IS NULL
+                GROUP BY st.enrollment_id
+                HAVING total_sessions > 0
+                ORDER BY punctuality_rate DESC, attendance_rate DESC, st.name
+            """, (start_date,)).fetchall()
+            
+            return jsonify({
+                'period_days': days,
+                'start_date': start_date.isoformat(),
+                'leaderboard': [dict(row) for row in leaderboard]
+            })
+    except Exception as e:
+        logger.error(f"Error generating punctuality leaderboard: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@app.route('/api/analytics/attendance-warnings', methods=['GET'])
+def get_attendance_warnings():
+    """Get students with attendance below 80% threshold"""
+    try:
+        threshold = float(request.args.get('threshold', 80.0))
+        days = int(request.args.get('days', 30))  # Default to last 30 days
+        start_date = datetime.date.today() - datetime.timedelta(days=days)
+        
+        with db.get_connection() as conn:
+            warnings = conn.execute("""
+                SELECT st.name, st.enrollment_id,
+                       COUNT(a.id) as total_sessions,
+                       COUNT(CASE WHEN a.status = 'present' THEN 1 END) as present_sessions,
+                       ROUND(
+                           COUNT(CASE WHEN a.status = 'present' THEN 1 END) * 100.0 / 
+                           NULLIF(COUNT(a.id), 0), 
+                           1
+                       ) as attendance_rate,
+                       COUNT(CASE WHEN a.is_late = 1 THEN 1 END) as late_sessions,
+                       ROUND(
+                           COUNT(CASE WHEN a.status = 'present' AND a.is_late = 0 THEN 1 END) * 100.0 / 
+                           NULLIF(COUNT(CASE WHEN a.status = 'present' THEN 1 END), 0), 
+                           1
+                       ) as punctuality_rate
+                FROM students st
+                LEFT JOIN attendance_summary a ON st.enrollment_id = a.student_id
+                LEFT JOIN sessions s ON a.session_id = s.id
+                WHERE DATE(s.start_time) >= ? OR s.id IS NULL
+                GROUP BY st.enrollment_id
+                HAVING total_sessions > 0 AND attendance_rate < ?
+                ORDER BY attendance_rate ASC, st.name
+            """, (start_date, threshold)).fetchall()
+            
+            return jsonify({
+                'threshold': threshold,
+                'period_days': days,
+                'start_date': start_date.isoformat(),
+                'warnings': [dict(row) for row in warnings],
+                'total_warnings': len(warnings)
+            })
+    except Exception as e:
+        logger.error(f"Error generating attendance warnings: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/auto-detect-session', methods=['GET'])
